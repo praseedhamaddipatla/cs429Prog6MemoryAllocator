@@ -1,3 +1,5 @@
-set -e
+#!/usr/bin/env bash
 
-gcc -Wall -Wextra -g allocator.c -lm -o hw6
+rm -rf build
+cmake -S . -B build
+make -C build

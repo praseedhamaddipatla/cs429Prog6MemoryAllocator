@@ -1,25 +1,12 @@
-#define _POSIX_C_SOURCE 199309L
+#include "tdmm.h"
 
-#include <ctype.h>
-#include <errno.h>
-#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
-
-typedef struct sec {
-    size_t size;
-    int free;
-    struct sec *n; // next
-    struct sec *p; // prev
-} sec;
-
-typedef enum policy { FIRST, BEST, WORST } policy;
 
 sec *frH = NULL;    // free head
 sec *allocH = NULL; // allocated head
@@ -27,7 +14,7 @@ sec *allocH = NULL; // allocated head
 void *mStart = NULL; // memory start
 size_t mSize = 0;    // memory size
 
-policy currPol;
+alloc_strat_e currPol;
 
 size_t totMap = 0;
 size_t totAlloc = 0;
@@ -35,36 +22,59 @@ size_t totOh = 0;
 double utilSum = 0;
 size_t utilCount = 0;
 
+// get ptr to tag at end of block
+size_t *tag(sec *s) {
+    return (size_t *)((char *)(s + 1) + s->size - sizeof(size_t));
+}
+
+// call when size or free changes
+void setTag(sec *s) {
+    *tag(s) = s->size;
+}
+
 // init globals
-int tinit(size_t size, policy pol) {
+void t_init(alloc_strat_e pol) {
+
+	frH = NULL;
+    allocH = NULL;
+
+    if (mStart != NULL && mStart != MAP_FAILED) {
+        munmap(mStart, mSize);
+    }
+
+    // null ptrs before remapping
+    mStart = NULL;
+    frH = NULL;
+    allocH = NULL;
+    mSize = 0;
+
     size_t pgSize = getpagesize();
-    mSize = ((size + pgSize - 1) / pgSize) * pgSize;
+    size_t requested = 64 * 1024 * 1024; //64 mb but ASK
+    mSize = ((requested + pgSize - 1) / pgSize) * pgSize;
 
     mStart = mmap(NULL, mSize, PROT_READ | PROT_WRITE,
                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
     if (mStart == MAP_FAILED) {
-        fprintf(stderr, "mmap failed");
+        fprintf(stderr, "mmap failed\n");
         exit(1);
     }
 
-    // init free block
+	//init free region
     frH = (sec *)mStart;
     frH->free = 1;
     frH->n = NULL;
     frH->p = NULL;
     frH->size = mSize - sizeof(sec);
+    setTag(frH);
 
     allocH = NULL;
     currPol = pol;
     totMap = mSize;
-
     totAlloc = 0;
     totOh = 0;
     utilSum = 0;
     utilCount = 0;
-
-    return 0;
 }
 
 // helper for removing block
@@ -84,18 +94,23 @@ void detach(sec **head, sec *s) {
     s->p = NULL;
 }
 
-// helper for inserting block
+// helper for inserting block sorted by addr
 void insert(sec **head, sec *s) {
-    if (s == NULL || head == NULL)
-        return;
-    s->n = *head;
-    s->p = NULL;
+    if (!s || !head) return;
 
-    if (*head != NULL) {
-        (*head)->p = s;
+    // first node with addr > s
+    sec *curr = *head;
+    sec *prev = NULL;
+    while (curr && curr < s) {
+        prev = curr;
+        curr = curr->n;
     }
 
-    *head = s;
+    // insert between prev and curr
+    s->n = curr;
+    s->p = prev;
+    if (curr) curr->p = s;
+    if (prev) prev->n = s; else *head = s;
 }
 
 size_t align(size_t size) {
@@ -172,19 +187,21 @@ sec *findWorst(size_t size) {
 void split(sec *s, size_t size) {
     size_t aligned = align(size);
 
-    if (s->size >= aligned + sizeof(sec) + 4) {
+    if (s->size >= aligned + sizeof(sec) + sizeof(size_t) + 4) {
         sec *new = (sec *)((char *)s + sizeof(sec) + aligned);
 
         new->size = s->size - aligned - sizeof(sec);
         new->free = 1;
-        new->n = s->n;
-        new->p = s;
+        new->n = NULL;
+        new->p = NULL;
 
-        if (s->n != NULL)
-            s->n->p = new;
-
-        s->n = new;
         s->size = aligned;
+
+        setTag(s);
+        setTag(new);
+
+        // insert remaining into free
+        insert(&frH, new);
     }
 }
 
@@ -197,29 +214,31 @@ void printStats() {
         printf("Avg Utilization: %.4f%%\n", 100.0 * utilSum / utilCount);
 }
 
-void *tmalloc(size_t size) {
+void *t_malloc(size_t size) {
+	if(size==0) return NULL;
     size_t aligned = align(size);
     sec *found = NULL;
 
     // choose policy
-    if (currPol == FIRST) {
+    if (currPol == FIRST_FIT) {
         found = findFirst(aligned);
-    } else if (currPol == BEST) {
+    } else if (currPol == BEST_FIT) {
         found = findBest(aligned);
-    } else if (currPol == WORST) {
+    } else if (currPol == WORST_FIT) {
         found = findWorst(aligned);
     } else {
         fprintf(stderr, "policy undefined");
         exit(1);
     }
     if (found == NULL) {
-        fprintf(stderr, "tmalloc failed");
-        exit(1);
+        fprintf(stderr, "t_malloc failed");
+        return NULL;
     }
     split(found, aligned);
 
     // mark allocated
     found->free = 0;
+    setTag(found);
 
     detach(&frH, found);
     insert(&allocH, found);
@@ -229,48 +248,62 @@ void *tmalloc(size_t size) {
     utilSum += (double)totAlloc / totMap;
     utilCount++;
 
-    // return pointer
+    // return ptr
     return (void *)(found + 1);
-
 }
 
+// consolidate adj free blocks
 void merge(sec *s) {
     // merge next
-    sec *next = (sec *)((char *)s + sizeof(sec) + s->size);
+    sec *next = (sec *)((char *)(s + 1) + s->size);
     if ((char *)next < (char *)mStart + mSize && next->free) {
         s->size += sizeof(sec) + next->size;
-        detach(&frH, next); // detach next
+        detach(&frH, next);
+        setTag(s);
     }
 
-    // -merge prev
-    sec *curr = frH;
-    while (curr != NULL) {
-        if (curr != s && (char *)curr + sizeof(sec) + curr->size == (char *)s) {
-            curr->size += sizeof(sec) + s->size;
+    // merge prev using tag
+    if ((char *)s - sizeof(size_t) >= (char *)mStart + sizeof(sec)) {
+        size_t *prevTag = (size_t *)s - 1;
+        size_t prevSize = *prevTag;
+
+        // sanity check
+        if (prevSize == 0 || prevSize > mSize) return;
+
+        sec *prev = (sec *)((char *)s - prevSize - sizeof(sec));
+
+        // bounds check prev header
+        if ((char *)prev < (char *)mStart || (char *)prev >= (char *)mStart + mSize) return;
+
+        // verify size match
+        if (prev->size != prevSize) return;
+
+        if (prev->free) {
+            prev->size += sizeof(sec) + s->size;
             detach(&frH, s);
-            break;
+            setTag(prev);
         }
-        curr = curr->n;
     }
 }
 
-void tfree(void *ptr) {
+void t_free(void *ptr) {
     if (ptr == NULL) {
         return;
     }
 
     sec *block = (sec *)ptr - 1;
 
-    // validate pointer exists
+    // validate ptr exists
     sec *check = allocH;
     while (check != NULL && check != block)
         check = check->n;
     if (check == NULL) {
-        fprintf(stderr, "tfree: invalid or already-freed pointer\n");
+        fprintf(stderr, "t_free: invalid or already-freed pointer\n");
         return;
     }
 
     block->free = 1;
+    setTag(block);
     detach(&allocH, block);
     insert(&frH, block);
 
@@ -283,34 +316,35 @@ void tfree(void *ptr) {
     printStats();
 }
 
-void benchmark() {
-    size_t sizes[] = {1,     4,     16,     64,      256,     1024,   4096,
-                      16384, 65536, 262144, 1048576, 4194304, 8388608};
-    int n = sizeof(sizes) / sizeof(sizes[0]);
+void t_gcollect(void) {
+    // use addr of local
+    volatile uintptr_t here = 0;
+    uintptr_t scanLo = ((uintptr_t)&here) & ~(sizeof(void *) - 1);
+    uintptr_t scanHi = scanLo + 65536;
 
-    for (int i = 0; i < n; i++) {
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        void *p = tmalloc(sizes[i]);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long ns =
-            (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
-        printf("tmalloc(%7zu): %ld ns\n", sizes[i], ns);
+    // sanity check
+    if (scanHi < scanLo || scanHi - scanLo > 1024 * 1024) return;
 
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        tfree(p);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        ns = (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
-        printf(" tfree(%7zu): %ld ns\n", sizes[i], ns);
-    }
-}
+    sec *block = allocH;
+    while (block) {
+        sec *next = block->n;
+        void *userPtr = (void *)(block + 1);
 
-// debug--remove later
-void printFr() {
-    sec *curr = frH;
-    while (curr) {
-        printf("Section at %p with size %zu and free state %d\n", curr,
-               curr->size, curr->free);
-        curr = curr->n;
+        int referenced = 0;
+        for (uintptr_t addr = scanLo; addr + sizeof(void *) <= scanHi; addr += sizeof(void *)) {
+            // skip my heap region
+            if (addr >= (uintptr_t)mStart && addr < (uintptr_t)mStart + mSize)
+                continue;
+            void *candidate = *(void **)addr;
+            if (candidate == userPtr) {
+                referenced = 1;
+                break;
+            }
+        }
+
+        if (!referenced)
+            t_free(userPtr);
+
+        block = next;
     }
 }
