@@ -30,7 +30,7 @@ size_t *tag(sec *s) {
 // call when size or free changes
 void setTag(sec *s) { *tag(s) = s->size; }
 
-// init globals
+// init structures
 void t_init(alloc_strat_e pol) {
 
     // unmap old heap
@@ -62,11 +62,11 @@ void t_init(alloc_strat_e pol) {
                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
     if (mStart == MAP_FAILED) {
-        perror("mmap failed");
+        fprintf(stderr, "mmap failed");
         exit(1);
     }
 
-    // init free
+    // init free list
     frH = (sec *)mStart;
 
     frH->size = mSize - sizeof(sec);
@@ -86,6 +86,7 @@ void detach(sec **head, sec *s) {
     if (!s || !head)
         return;
 
+    // check prev/next exist first
     if (s->p)
         s->p->n = s->n;
     else
@@ -126,6 +127,7 @@ size_t align(size_t size) {
     if (size % 4 == 0) {
         return size;
     }
+    // round to next multiple of 4
     return ((size + 3) / 4) * 4;
 }
 
@@ -149,11 +151,11 @@ sec *findBest(size_t size) {
     while (search != NULL) {
         if (search->size >= size) {
 
-            size_t curr_diff = search->size - size;
+            size_t currDiff = search->size - size;
 
-            if (best == NULL || curr_diff < diff) {
+            if (best == NULL || currDiff < diff) {
                 best = search;
-                diff = curr_diff;
+                diff = currDiff;
             }
         }
         search = search->n;
@@ -175,11 +177,11 @@ sec *findWorst(size_t size) {
 
         if (search->size >= size) {
 
-            size_t curr_diff = search->size - size;
+            size_t currDiff = search->size - size;
 
-            if (worst == NULL || curr_diff > diff) {
+            if (worst == NULL || currDiff > diff) {
                 worst = search;
-                diff = curr_diff;
+                diff = currDiff;
             }
         }
 
@@ -193,20 +195,17 @@ sec *findWorst(size_t size) {
     return worst;
 }
 
-void split(sec *s, size_t aligned)
-{
-    size_t totalBlockSize =
-        sizeof(sec) + s->size + sizeof(size_t);
+void split(sec *s, size_t aligned) {
+    size_t total = sizeof(sec) + s->size + sizeof(size_t);
 
-    size_t usedBlockSize =
-        sizeof(sec) + aligned + sizeof(size_t);
+    size_t used = sizeof(sec) + aligned + sizeof(size_t);
 
-    size_t remaining = totalBlockSize - usedBlockSize;
+    size_t remaining = total - used;
 
     if (remaining <= sizeof(sec) + sizeof(size_t) + 4)
         return;
 
-    sec *new = (sec *)((char *)s + usedBlockSize);
+    sec *new = (sec *)((char *)s + used);
 
     new->size = remaining - sizeof(sec) - sizeof(size_t);
     new->free = 1;
@@ -269,58 +268,43 @@ void *t_malloc(size_t size) {
 }
 
 // consolidate adj free blocks
-void merge(sec *s)
-{
+void merge(sec *s) {
     char *heapStart = (char *)mStart;
-    char *heapEnd   = heapStart + mSize;
+    char *heapEnd = heapStart + mSize;
 
     // merge next
     char *nextAddr = (char *)s + sizeof(sec) + s->size + sizeof(size_t);
 
-    if (nextAddr + sizeof(sec) <= heapEnd)
-    {
+    if (nextAddr + sizeof(sec) <= heapEnd) {
         sec *next = (sec *)nextAddr;
-
-        if (next->free)
-        {
+        if (next->free) {
             detach(&frH, next);
-
             s->size += sizeof(sec) + sizeof(size_t) + next->size;
-
             setTag(s);
         }
     }
 
     // merge prev
-    char *footerAddr = (char *)s - sizeof(size_t);
+    char *tagAddr = (char *)s - sizeof(size_t);
 
-    if (footerAddr >= heapStart)
-    {
-        size_t prevSize = *(size_t *)footerAddr;
+    if (tagAddr >= heapStart) {
+        size_t prevSize = *(size_t *)tagAddr;
+        char *prevAddr = (char *)s - sizeof(size_t) - sizeof(sec) - prevSize;
 
-        char *prevAddr =
-            (char *)s - sizeof(size_t) - sizeof(sec) - prevSize;
-
-        if (prevAddr >= heapStart)
-        {
+        if (prevAddr >= heapStart) {
             sec *prev = (sec *)prevAddr;
 
-            if (prev->free && prev->size == prevSize)
-            {
+            if (prev->free && prev->size == prevSize) {
                 detach(&frH, s);
-
                 prev->size += sizeof(sec) + sizeof(size_t) + s->size;
-
                 setTag(prev);
-
                 s = prev;
             }
         }
     }
 }
 
-void t_free(void *ptr)
-{
+void t_free(void *ptr) {
     if (!ptr)
         return;
 
@@ -331,39 +315,33 @@ void t_free(void *ptr)
     while (check && check != block)
         check = check->n;
 
-    if (!check)
-    {
-        fprintf(stderr, "t_free: invalid or already-freed pointer\n");
+    if (!check) {
+        fprintf(stderr, "invalid or already-freed pointer\n");
         return;
     }
 
     // remove from alloc list
     detach(&allocH, block);
-
     block->free = 1;
     setTag(block);
 
     totAlloc -= block->size;
     totOh -= sizeof(sec);
-
     utilSum += (double)totAlloc / totMap;
     utilCount++;
 
     // merge before inserting into free list
     merge(block);
 
-    // find true merged block
+    // find merged block
     sec *merged = block;
 
-    char *footerAddr = (char *)block - sizeof(size_t);
-    if (footerAddr >= (char *)mStart)
-    {
-        size_t prevSize = *(size_t *)footerAddr;
+    char *tagAddr = (char *)block - sizeof(size_t);
+    if (tagAddr >= (char *)mStart) {
+        size_t prevSize = *(size_t *)tagAddr;
         char *prevAddr =
             (char *)block - sizeof(size_t) - sizeof(sec) - prevSize;
-
-        if (prevAddr >= (char *)mStart)
-        {
+        if (prevAddr >= (char *)mStart) {
             sec *prev = (sec *)prevAddr;
             if (prev->free)
                 merged = prev;
@@ -371,6 +349,5 @@ void t_free(void *ptr)
     }
 
     insert(&frH, merged);
-
-    printStats();
+    //printStats();
 }
