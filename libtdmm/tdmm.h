@@ -38,11 +38,6 @@ void *t_malloc(size_t size);
  */
 void t_free(void *ptr);
 
-/**
- * Performs basic garbage collection by scanning the stack and heap managed by t_malloc and t_free.
- */
-void t_gcollect(void);
-
 void printStats(void);
 
 #endif // TDMM_H

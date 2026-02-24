@@ -5,5 +5,5 @@ set(CMAKE_C_STANDARD 99)
 
 add_subdirectory(libtdmm)
 
-add_executable(hw6 main.c)
+add_executable(hw6 test.c)
 target_link_libraries(hw6 tdmm)

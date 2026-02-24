@@ -28,53 +28,57 @@ size_t *tag(sec *s) {
 }
 
 // call when size or free changes
-void setTag(sec *s) {
-    *tag(s) = s->size;
-}
+void setTag(sec *s) { *tag(s) = s->size; }
 
 // init globals
 void t_init(alloc_strat_e pol) {
 
-	frH = NULL;
-    allocH = NULL;
-
-    if (mStart != NULL && mStart != MAP_FAILED) {
+    // unmap old heap
+    if (mStart && mStart != MAP_FAILED) {
         munmap(mStart, mSize);
     }
 
-    // null ptrs before remapping
+    // reset all globals
     mStart = NULL;
+    mSize = 0;
     frH = NULL;
     allocH = NULL;
-    mSize = 0;
 
+    currPol = pol;
+
+    totMap = 0;
+    totAlloc = 0;
+    totOh = 0;
+    utilSum = 0;
+    utilCount = 0;
+
+    // map new heap
     size_t pgSize = getpagesize();
-    size_t requested = 64 * 1024 * 1024; //64 mb but ASK
+    size_t requested = 64 * 1024 * 1024;
+
     mSize = ((requested + pgSize - 1) / pgSize) * pgSize;
 
     mStart = mmap(NULL, mSize, PROT_READ | PROT_WRITE,
                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
     if (mStart == MAP_FAILED) {
-        fprintf(stderr, "mmap failed\n");
+        perror("mmap failed");
         exit(1);
     }
 
-	//init free region
+    // init free
     frH = (sec *)mStart;
+
+    frH->size = mSize - sizeof(sec);
     frH->free = 1;
     frH->n = NULL;
     frH->p = NULL;
-    frH->size = mSize - sizeof(sec);
+
     setTag(frH);
 
     allocH = NULL;
-    currPol = pol;
+
     totMap = mSize;
-    totAlloc = 0;
-    totOh = 0;
-    utilSum = 0;
-    utilCount = 0;
 }
 
 // helper for removing block
@@ -96,7 +100,8 @@ void detach(sec **head, sec *s) {
 
 // helper for inserting block sorted by addr
 void insert(sec **head, sec *s) {
-    if (!s || !head) return;
+    if (!s || !head)
+        return;
 
     // first node with addr > s
     sec *curr = *head;
@@ -109,8 +114,12 @@ void insert(sec **head, sec *s) {
     // insert between prev and curr
     s->n = curr;
     s->p = prev;
-    if (curr) curr->p = s;
-    if (prev) prev->n = s; else *head = s;
+    if (curr)
+        curr->p = s;
+    if (prev)
+        prev->n = s;
+    else
+        *head = s;
 }
 
 size_t align(size_t size) {
@@ -184,25 +193,32 @@ sec *findWorst(size_t size) {
     return worst;
 }
 
-void split(sec *s, size_t size) {
-    size_t aligned = align(size);
+void split(sec *s, size_t aligned)
+{
+    size_t totalBlockSize =
+        sizeof(sec) + s->size + sizeof(size_t);
 
-    if (s->size >= aligned + sizeof(sec) + sizeof(size_t) + 4) {
-        sec *new = (sec *)((char *)s + sizeof(sec) + aligned);
+    size_t usedBlockSize =
+        sizeof(sec) + aligned + sizeof(size_t);
 
-        new->size = s->size - aligned - sizeof(sec);
-        new->free = 1;
-        new->n = NULL;
-        new->p = NULL;
+    size_t remaining = totalBlockSize - usedBlockSize;
 
-        s->size = aligned;
+    if (remaining <= sizeof(sec) + sizeof(size_t) + 4)
+        return;
 
-        setTag(s);
-        setTag(new);
+    sec *new = (sec *)((char *)s + usedBlockSize);
 
-        // insert remaining into free
-        insert(&frH, new);
-    }
+    new->size = remaining - sizeof(sec) - sizeof(size_t);
+    new->free = 1;
+    new->n = NULL;
+    new->p = NULL;
+
+    s->size = aligned;
+
+    setTag(s);
+    setTag(new);
+
+    insert(&frH, new);
 }
 
 void printStats() {
@@ -215,7 +231,8 @@ void printStats() {
 }
 
 void *t_malloc(size_t size) {
-	if(size==0) return NULL;
+    if (size == 0)
+        return NULL;
     size_t aligned = align(size);
     sec *found = NULL;
 
@@ -234,13 +251,12 @@ void *t_malloc(size_t size) {
         fprintf(stderr, "t_malloc failed");
         return NULL;
     }
-    split(found, aligned);
-
-    // mark allocated
-    found->free = 0;
-    setTag(found);
 
     detach(&frH, found);
+    split(found, aligned);
+
+    found->free = 0;
+    setTag(found);
     insert(&allocH, found);
 
     totAlloc += found->size;
@@ -253,98 +269,108 @@ void *t_malloc(size_t size) {
 }
 
 // consolidate adj free blocks
-void merge(sec *s) {
+void merge(sec *s)
+{
+    char *heapStart = (char *)mStart;
+    char *heapEnd   = heapStart + mSize;
+
     // merge next
-    sec *next = (sec *)((char *)(s + 1) + s->size);
-    if ((char *)next < (char *)mStart + mSize && next->free) {
-        s->size += sizeof(sec) + next->size;
-        detach(&frH, next);
-        setTag(s);
+    char *nextAddr = (char *)s + sizeof(sec) + s->size + sizeof(size_t);
+
+    if (nextAddr + sizeof(sec) <= heapEnd)
+    {
+        sec *next = (sec *)nextAddr;
+
+        if (next->free)
+        {
+            detach(&frH, next);
+
+            s->size += sizeof(sec) + sizeof(size_t) + next->size;
+
+            setTag(s);
+        }
     }
 
-    // merge prev using tag
-    if ((char *)s - sizeof(size_t) >= (char *)mStart + sizeof(sec)) {
-        size_t *prevTag = (size_t *)s - 1;
-        size_t prevSize = *prevTag;
+    // merge prev
+    char *footerAddr = (char *)s - sizeof(size_t);
 
-        // sanity check
-        if (prevSize == 0 || prevSize > mSize) return;
+    if (footerAddr >= heapStart)
+    {
+        size_t prevSize = *(size_t *)footerAddr;
 
-        sec *prev = (sec *)((char *)s - prevSize - sizeof(sec));
+        char *prevAddr =
+            (char *)s - sizeof(size_t) - sizeof(sec) - prevSize;
 
-        // bounds check prev header
-        if ((char *)prev < (char *)mStart || (char *)prev >= (char *)mStart + mSize) return;
+        if (prevAddr >= heapStart)
+        {
+            sec *prev = (sec *)prevAddr;
 
-        // verify size match
-        if (prev->size != prevSize) return;
+            if (prev->free && prev->size == prevSize)
+            {
+                detach(&frH, s);
 
-        if (prev->free) {
-            prev->size += sizeof(sec) + s->size;
-            detach(&frH, s);
-            setTag(prev);
+                prev->size += sizeof(sec) + sizeof(size_t) + s->size;
+
+                setTag(prev);
+
+                s = prev;
+            }
         }
     }
 }
 
-void t_free(void *ptr) {
-    if (ptr == NULL) {
+void t_free(void *ptr)
+{
+    if (!ptr)
         return;
-    }
 
     sec *block = (sec *)ptr - 1;
 
-    // validate ptr exists
+    // validate exists in alloc list
     sec *check = allocH;
-    while (check != NULL && check != block)
+    while (check && check != block)
         check = check->n;
-    if (check == NULL) {
+
+    if (!check)
+    {
         fprintf(stderr, "t_free: invalid or already-freed pointer\n");
         return;
     }
 
+    // remove from alloc list
+    detach(&allocH, block);
+
     block->free = 1;
     setTag(block);
-    detach(&allocH, block);
-    insert(&frH, block);
 
     totAlloc -= block->size;
     totOh -= sizeof(sec);
+
     utilSum += (double)totAlloc / totMap;
     utilCount++;
 
+    // merge before inserting into free list
     merge(block);
-    printStats();
-}
 
-void t_gcollect(void) {
-    // use addr of local
-    volatile uintptr_t here = 0;
-    uintptr_t scanLo = ((uintptr_t)&here) & ~(sizeof(void *) - 1);
-    uintptr_t scanHi = scanLo + 65536;
+    // find true merged block
+    sec *merged = block;
 
-    // sanity check
-    if (scanHi < scanLo || scanHi - scanLo > 1024 * 1024) return;
+    char *footerAddr = (char *)block - sizeof(size_t);
+    if (footerAddr >= (char *)mStart)
+    {
+        size_t prevSize = *(size_t *)footerAddr;
+        char *prevAddr =
+            (char *)block - sizeof(size_t) - sizeof(sec) - prevSize;
 
-    sec *block = allocH;
-    while (block) {
-        sec *next = block->n;
-        void *userPtr = (void *)(block + 1);
-
-        int referenced = 0;
-        for (uintptr_t addr = scanLo; addr + sizeof(void *) <= scanHi; addr += sizeof(void *)) {
-            // skip my heap region
-            if (addr >= (uintptr_t)mStart && addr < (uintptr_t)mStart + mSize)
-                continue;
-            void *candidate = *(void **)addr;
-            if (candidate == userPtr) {
-                referenced = 1;
-                break;
-            }
+        if (prevAddr >= (char *)mStart)
+        {
+            sec *prev = (sec *)prevAddr;
+            if (prev->free)
+                merged = prev;
         }
-
-        if (!referenced)
-            t_free(userPtr);
-
-        block = next;
     }
+
+    insert(&frH, merged);
+
+    printStats();
 }

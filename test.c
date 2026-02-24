@@ -206,19 +206,6 @@ static void correctness_tests() {
     printf("w4 should be near w1 region: w1=%p w4=%p\n", w1, w4);
     t_free(w2);
     t_free(w4);
-
-    section("TEST 11: GC Collect");
-    t_init(FIRST_FIT);
-    void *g1 = t_malloc(64);
-    t_malloc(64); // intentionally discarded — no pointer kept
-    printf("Before gcollect (2 blocks allocated, 1 unreferenced):\n");
-    printStats();
-    t_gcollect();
-    printf("After gcollect (unreferenced block should be freed):\n");
-    printStats();
-    t_free(g1);
-
-    section("CORRECTNESS TESTS COMPLETE");
 }
 
 //  main
