@@ -196,7 +196,6 @@ sec *findBest(size_t size) {
     if (best == NULL) {
         best = allocMore(size);
     }
-
     return best;
 }
 
@@ -204,9 +203,7 @@ sec *findWorst(size_t size) {
     sec *search = frH;
     sec *worst = NULL;
     size_t diff = 0;
-
     while (search != NULL) {
-
         if (search->size >= size) {
 
             size_t currDiff = search->size - size;
@@ -223,7 +220,6 @@ sec *findWorst(size_t size) {
     if (worst == NULL) {
         worst = allocMore(size);
     }
-
     return worst;
 }
 
@@ -364,11 +360,8 @@ void t_free(void *ptr) {
     utilSum += (double)totAlloc / totMap;
     utilCount++;
 
-    // merge before inserting into free list
-    merge(block);
-
     // find merged block
+    insert(&frH, block);
     sec *merged = merge(block);
-    insert(&frH, merged);
     // printStats();
 }

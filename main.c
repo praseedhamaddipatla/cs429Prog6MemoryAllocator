@@ -16,7 +16,6 @@ static long nsDiff(struct timespec t0, struct timespec t1) {
 static void runBench(const char *name, alloc_strat_e pol) {
     printf("\n===== %s =====\n", name);
 
-    // sizes range from 1b to 8mb 
     size_t sizes[] = {1, 4, 16, 64, 256, 1024, 4096,
                       16384, 65536, 262144, 1048576, 4194304, 8388608};
     int n = sizeof(sizes) / sizeof(sizes[0]);
@@ -24,27 +23,41 @@ static void runBench(const char *name, alloc_strat_e pol) {
     printf("%-12s %15s %15s\n", "Size (B)", "tmalloc (ns)", "tfree (ns)");
     printf("%-12s %15s %15s\n", "--------", "------------", "----------");
 
+    int iters = 200;
+
     for (int i = 0; i < n; i++) {
-        t_init(pol); // fresh heap each iter
+        t_init(pol);
 
-        struct timespec t0, t1;
+        #define NHOLES 20
+        void *pin[NHOLES];
+        void *hole[NHOLES];
+        size_t pattern[] = {512, 64, 256, 128, 512, 64, 256, 128, 32, 512};
+        for (int j = 0; j < NHOLES; j++) {
+            hole[j] = t_malloc(pattern[j % 10]);
+            pin[j]  = t_malloc(32);
+        }
+        for (int j = 0; j < NHOLES; j++)
+            t_free(hole[j]);
 
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        void *p = t_malloc(sizes[i]);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long mallocNs = nsDiff(t0, t1);
+        long totalMalloc = 0, totalFree = 0;
+        for (int r = 0; r < iters; r++) {
+            struct timespec t0, t1;
 
-        if (p == NULL) {
-            printf("%-12zu %15s %15s\n", sizes[i], "OOM", "OOM");
-            continue;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            void *p = t_malloc(sizes[i]);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            totalMalloc += nsDiff(t0, t1);
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (p) t_free(p);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            totalFree += nsDiff(t0, t1);
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        t_free(p);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long freeNs = nsDiff(t0, t1);
+        printf("%-12zu %15ld %15ld\n", sizes[i], totalMalloc/iters, totalFree/iters);
 
-        printf("%-12zu %15ld %15ld\n", sizes[i], mallocNs, freeNs);
+        for (int j = 0; j < NHOLES; j++)
+            t_free(pin[j]);
     }
 
     printf("\nFinal stats after benchmark:\n");
@@ -58,18 +71,17 @@ static void utilTest(const char *name, alloc_strat_e pol) {
 
     printf("Step, Event, Size, Utilization%%\n");
 
-    size_t sizes[] = {64, 128, 256, 512, 1024, 2048, 128, 64, 512, 256};
+    // 10 blocks * avg ~1200 bytes = ~12000 bytes + headers ~= 75%
+    size_t sizes[] = {2048, 512, 1024, 256, 2048, 1024, 512, 2048, 256, 1024};
     int n = sizeof(sizes) / sizeof(sizes[0]);
     void *ptrs[10];
 
-    // alloc all blocks
     for (int i = 0; i < n; i++) {
         ptrs[i] = t_malloc(sizes[i]);
         printf("%d, alloc, %zu, ", i, sizes[i]);
         printStats();
     }
 
-    // free every other block to create fragmentation
     for (int i = 0; i < n; i += 2) {
         t_free(ptrs[i]);
         ptrs[i] = NULL;
@@ -77,14 +89,12 @@ static void utilTest(const char *name, alloc_strat_e pol) {
         printStats();
     }
 
-    // realloc into fragmented heap w/ half sizes to test fit into holes 
     for (int i = 0; i < n; i += 2) {
-        ptrs[i] = t_malloc(sizes[i] / 2);
-        printf("%d, realloc, %zu, ", n + n / 2 + i / 2, sizes[i] / 2);
+        ptrs[i] = t_malloc(96);
+        printf("%d, realloc, 96, ", n + n / 2 + i / 2);
         printStats();
     }
 
-    // free everything remaining
     for (int i = 0; i < n; i++) {
         if (ptrs[i])
             t_free(ptrs[i]);
@@ -106,7 +116,7 @@ static void overheadTest(const char *name, alloc_strat_e pol) {
         size_t sz = (i + 1) * 64;
         ptrs[i] = t_malloc(sz);
         totUser += sz;
-        // overhead = num headers * size of one header (sec struct) 
+        // overhead = num headers * size of one header
         size_t overhead = (i + 1) * sizeof(sec);
         printf("%-10d %-12zu %-12zu %-12.4f\n", i + 1, totUser, overhead,
                (double)overhead / (totUser + overhead));
@@ -157,7 +167,7 @@ static void correctnessTests() {
     printf("\n===== TEST 7: Double Free (expect error, no crash) =====\n");
     void *p4 = t_malloc(64);
     t_free(p4);
-    t_free(p4); // second free should fail gracefully
+    t_free(p4); // second free should fail and print to stderr
 
     printf("\n===== TEST 8: Zero Size Malloc =====\n");
     void *p5 = t_malloc(0);
