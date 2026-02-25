@@ -15,13 +15,6 @@ static long nsDiff(struct timespec t0, struct timespec t1) {
 // benchmark malloc/free speed across log-scale sizes 
 static void runBench(const char *name, alloc_strat_e pol) {
     printf("\n===== %s =====\n", name);
-    printf("DEBUG: calling t_init\n"); fflush(stdout);
-    t_init(pol);
-    printf("DEBUG: t_init done, calling t_malloc(1)\n"); fflush(stdout);
-    void *test = t_malloc(1);
-    printf("DEBUG: t_malloc(1) = %p\n", test); fflush(stdout);
-    t_free(test);
-    printf("DEBUG: t_free done\n"); fflush(stdout);
 
     // sizes range from 1b to 8mb 
     size_t sizes[] = {1, 4, 16, 64, 256, 1024, 4096,
