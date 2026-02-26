@@ -54,7 +54,8 @@ void t_init(alloc_strat_e pol) {
 
     // map new heap
     size_t pgSize = getpagesize();
-    size_t requested = 4*pgSize;
+    //allocate less initially to improve memory utilization
+    size_t requested = pgSize;
 
     mSize = ((requested + pgSize - 1) / pgSize) * pgSize;
 
