@@ -8,7 +8,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define MIN (64*1024)
+#define MIN getpagesize()
 
 sec *frH = NULL;    // free head
 sec *allocH = NULL; // allocated head
@@ -53,7 +53,7 @@ void t_init(alloc_strat_e pol) {
     utilCount = 0;
 
     // map new heap
-    size_t pgSize = getpagesize();
+    size_t pgSize = MIN;
     //allocate less initially to improve memory utilization
     size_t requested = pgSize;
 
