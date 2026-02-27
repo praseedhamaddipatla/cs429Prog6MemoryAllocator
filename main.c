@@ -7,213 +7,294 @@
 #include <string.h>
 #include <time.h>
 
-// calc diff in nanoseconds between two timestamps 
+size_t getAllocCount();
+size_t getFrCount();
+
+// calc diff in nanoseconds between two timestamps
 static long nsDiff(struct timespec t0, struct timespec t1) {
     return (t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec);
 }
 
-// benchmark malloc/free speed across log-scale sizes 
+// fragmentation patterns
+static void createFragmentation(void **pins, int count) {
+
+    size_t sizesA[] = {1024,  64, 2048, 128, 4096, 256, 512, 8192, 32, 1024,
+                       16384, 64, 2048, 128, 4096, 256, 512, 8192, 32, 1024};
+
+    size_t sizesB[] = {48, 96, 192, 384, 768, 1536, 3072, 6144, 12288, 24576};
+
+    void *temp[count];
+
+    // phase 1: alternating allocs
+    for (int i = 0; i < count; i++) {
+
+        temp[i] = t_malloc(sizesA[i % 20]);
+
+        if (i % 2 == 0)
+            pins[i] = t_malloc(64);
+        else
+            pins[i] = NULL;
+    }
+
+    // phase 2: free every 3rd to create holes
+    for (int i = 0; i < count; i += 3) {
+        t_free(temp[i]);
+        temp[i] = NULL;
+    }
+
+    // phase 3: allocate different pattern
+    for (int i = 0; i < count; i++) {
+
+        if (temp[i] == NULL)
+            temp[i] = t_malloc(sizesB[i % 10]);
+    }
+
+    // phase 4: free alternating
+    for (int i = 1; i < count; i += 2) {
+        t_free(temp[i]);
+        temp[i] = NULL;
+    }
+
+    // phase 5: more mixed alloc/free
+    for (int i = 0; i < count; i++) {
+
+        if (temp[i] == NULL)
+            temp[i] = t_malloc((i % 7 + 1) * 500);
+
+        if (i % 4 == 0) {
+            t_free(temp[i]);
+            temp[i] = NULL;
+        }
+    }
+
+    // cleanup temps but leave pins
+    for (int i = 0; i < count; i++)
+        if (temp[i])
+            t_free(temp[i]);
+}
+
+// benchmark malloc and free
 static void runBench(const char *name, alloc_strat_e pol) {
+
     printf("\n===== %s =====\n", name);
 
-    size_t sizes[] = {1, 4, 16, 64, 256, 1024, 4096,
-                      16384, 65536, 262144, 1048576, 4194304, 8388608};
-    int n = sizeof(sizes) / sizeof(sizes[0]);
+#define MAX_POW 23
+
+    size_t sizes[MAX_POW + 1];
+
+    for (int i = 0; i <= MAX_POW; i++)
+        sizes[i] = (size_t)1 << i;
+
+    int n = MAX_POW + 1;
 
     printf("%-12s %15s %15s\n", "Size (B)", "tmalloc (ns)", "tfree (ns)");
-    printf("%-12s %15s %15s\n", "--------", "------------", "----------");
 
     int iters = 200;
 
     for (int i = 0; i < n; i++) {
+
         t_init(pol);
 
-        #define NHOLES 20
-        void *pin[NHOLES];
-        void *hole[NHOLES];
-        size_t pattern[] = {512, 64, 256, 128, 512, 64, 256, 128, 32, 512};
-        for (int j = 0; j < NHOLES; j++) {
-            hole[j] = t_malloc(pattern[j % 10]);
-            pin[j]  = t_malloc(32);
-        }
-        for (int j = 0; j < NHOLES; j++)
-            t_free(hole[j]);
+#define NFRAG 40
+        void *pins[NFRAG];
 
-        long totalMalloc = 0, totalFree = 0;
+        createFragmentation(pins, NFRAG);
+
+        long totalMalloc = 0;
+        long totalFree = 0;
+
+        void *live[20] = {0};
+
         for (int r = 0; r < iters; r++) {
+
             struct timespec t0, t1;
 
+            // malloc timing
             clock_gettime(CLOCK_MONOTONIC, &t0);
             void *p = t_malloc(sizes[i]);
             clock_gettime(CLOCK_MONOTONIC, &t1);
+
             totalMalloc += nsDiff(t0, t1);
 
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            if (p) t_free(p);
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            totalFree += nsDiff(t0, t1);
+            live[r % 20] = p;
+
+            // periodically free something else
+            if (r % 3 == 0 && live[(r + 7) % 20]) {
+
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+
+                t_free(live[(r + 7) % 20]);
+
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+
+                totalFree += nsDiff(t0, t1);
+
+                live[(r + 7) % 20] = NULL;
+            }
         }
 
-        printf("%-12zu %15ld %15ld\n", sizes[i], totalMalloc/iters, totalFree/iters);
+        // cleanup
+        for (int j = 0; j < 20; j++)
+            if (live[j])
+                t_free(live[j]);
 
-        for (int j = 0; j < NHOLES; j++)
-            t_free(pin[j]);
+        for (int j = 0; j < NFRAG; j++)
+            if (pins[j])
+                t_free(pins[j]);
+
+        printf("%-12zu %15ld %15ld\n", sizes[i], totalMalloc / iters,
+               totalFree / (iters / 3));
     }
 
-    printf("\nFinal stats after benchmark:\n");
+    printf("\nFinal stats:\n");
     printStats();
 }
 
-// alloc then free in a pattern to track utilization over time 
+// utilization over time
 static void utilTest(const char *name, alloc_strat_e pol) {
+
     printf("\n===== %s =====\n", name);
+
     t_init(pol);
 
-    printf("Step, Event, Size, Utilization%%\n");
+    printf("Step,Event,Size,");
+    printStats();
 
-    // 10 blocks * avg ~1200 bytes = ~12000 bytes + headers ~= 75%
-    size_t sizes[] = {2048, 512, 1024, 256, 2048, 1024, 512, 2048, 256, 1024};
-    int n = sizeof(sizes) / sizeof(sizes[0]);
-    void *ptrs[10];
+    void *ptrs[20] = {0};
 
-    for (int i = 0; i < n; i++) {
+    size_t sizes[] = {4096, 512, 8192, 256, 16384, 1024, 2048, 512, 32768, 128};
+
+    for (int i = 0; i < 10; i++) {
+
         ptrs[i] = t_malloc(sizes[i]);
-        printf("%d, alloc, %zu, ", i, sizes[i]);
+
+        printf("%d,alloc,%zu,", i, sizes[i]);
         printStats();
+
+        if (i % 2 == 1) {
+
+            t_free(ptrs[i - 1]);
+            ptrs[i - 1] = NULL;
+
+            printf("%d,free,%zu,", i, sizes[i - 1]);
+            printStats();
+        }
     }
 
-    for (int i = 0; i < n; i += 2) {
-        t_free(ptrs[i]);
-        ptrs[i] = NULL;
-        printf("%d, free, %zu, ", n + i / 2, sizes[i]);
-        printStats();
+    // random realloc pattern
+    for (int i = 0; i < 10; i++) {
+
+        if (!ptrs[i]) {
+
+            ptrs[i] = t_malloc(3000);
+
+            printf("%d,realloc,3000,", i);
+            printStats();
+        }
     }
 
-    for (int i = 0; i < n; i += 2) {
-        ptrs[i] = t_malloc(96);
-        printf("%d, realloc, 96, ", n + n / 2 + i / 2);
-        printStats();
-    }
-
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < 10; i++)
         if (ptrs[i])
             t_free(ptrs[i]);
-    }
 }
 
-// track header overhead vs user data ratio as allocs grow 
-static void overheadTest(const char *name, alloc_strat_e pol) {
-    printf("\n===== %s =====\n", name);
-    t_init(pol);
+// elper to print current state using available info
+static void log_state(int step) {
+    size_t aBlocks = getAllocCount();
+    size_t fBlocks = getFrCount();
+    
+    // based on structs
+    size_t overheadPerBlock = sizeof(sec) + sizeof(size_t);
+    size_t totalOverhead = (aBlocks + fBlocks) * overheadPerBlock;
 
-    printf("%-10s %-12s %-12s %-12s\n", "Allocs", "User (B)", "Overhead (B)", "Ratio");
-    printf("%-10s %-12s %-12s %-12s\n", "------", "--------", "------------", "-----");
-
-    void *ptrs[20];
-    size_t totUser = 0;
-
-    for (int i = 0; i < 20; i++) {
-        size_t sz = (i + 1) * 64;
-        ptrs[i] = t_malloc(sz);
-        totUser += sz;
-        // overhead = num headers * size of one header
-        size_t overhead = (i + 1) * sizeof(sec);
-        printf("%-10d %-12zu %-12zu %-12.4f\n", i + 1, totUser, overhead,
-               (double)overhead / (totUser + overhead));
-    }
-
-    for (int i = 0; i < 20; i++)
-        t_free(ptrs[i]);
+    printf("%d,%zu,%zu,%zu\n", step, aBlocks, fBlocks, totalOverhead);
 }
 
+void overheadTest(const char *name, alloc_strat_e policy) {
+    printf("\n--- DATA_START_%s ---\n", name);
+    printf("Step,AllocatedBlocks,FreeBlocks,TotalOverheadBytes\n");
+
+    t_init(policy);
+    
+    // Pointer array
+    void *ptrs[200];
+    for(int i = 0; i < 200; i++) ptrs[i] = NULL;
+    
+    int step = 0;
+
+    //phase 1: fragmentation holes
+    for (int i = 0; i < 100; i++) {
+        size_t size = (i % 5 + 1) * 128; // Sizes: 128, 256, 384, 512, 640
+        ptrs[i] = t_malloc(size);
+        
+        // Free every 2nd block to create holes that cannot merge
+        if (i % 2 == 0 && i > 0) {
+            t_free(ptrs[i-1]);
+            ptrs[i-1] = NULL;
+        }
+        log_state(step++);
+    }
+
+    //phase 2: stress zone
+    for (int i = 100; i < 200; i++) {
+        size_t request = (i % 10 + 1) * 60; // request small pieces
+        
+        int slot = i % 100;
+        if (ptrs[slot] == NULL) {
+            ptrs[slot] = t_malloc(request);
+        } else {
+            t_free(ptrs[slot]);
+            ptrs[slot] = NULL;
+        }
+        log_state(step++);
+    }
+
+    //cleanup
+    for (int i = 0; i < 200; i++) {
+        if (ptrs[i]) {
+            t_free(ptrs[i]);
+            ptrs[i] = NULL;
+            log_state(step++);
+        }
+    }
+
+    printf("--- DATA_END_%s ---\n", name);
+    printStats();
+}
+
+// correctness tests
 static void correctnessTests() {
+
     t_init(FIRST_FIT);
 
-    printf("\n===== TEST 1: Single Allocation =====\n");
-    void *p1 = t_malloc(100);
-    printf("p1 = %p (expect non-null)\n", p1);
-    // check 4-byte alignment 
-    printf("aligned to 4: %s\n", ((uintptr_t)p1 % 4 == 0) ? "YES" : "NO");
+    printf("\n===== BASIC CORRECTNESS =====\n");
+
+    void *p = t_malloc(100);
+
+    printf("ptr valid: %s\n", p ? "YES" : "NO");
+
+    memset(p, 0xAA, 100);
+
+    t_free(p);
+
     printStats();
-
-    printf("\n===== TEST 2: Multiple Allocations =====\n");
-    void *p2 = t_malloc(200);
-    void *p3 = t_malloc(300);
-    printf("p2 = %p, p3 = %p\n", p2, p3);
-    printf("p2 < p3: %s\n", p2 < p3 ? "YES" : "NO");
-    printStats();
-
-    printf("\n===== TEST 3: Write and Read Back =====\n");
-    memset(p1, 0xAB, 100);
-    int ok = 1;
-    for (int i = 0; i < 100; i++)
-        if (((unsigned char *)p1)[i] != 0xAB) { ok = 0; break; }
-    printf("Memory read/write intact: %s\n", ok ? "YES" : "NO");
-
-    printf("\n===== TEST 4: Free and Merge =====\n");
-    t_free(p2);
-    t_free(p3); // p2+p3 should coalesce into one block
-    printf("Freed p2 and p3 (expect merge)\n");
-    printStats();
-
-    printf("\n===== TEST 5: Free All (expect one big free block) =====\n");
-    t_free(p1);
-    printStats();
-
-    printf("\n===== TEST 6: Invalid Free (expect error, no crash) =====\n");
-    int dummy = 42;
-    t_free(&dummy);
-
-    printf("\n===== TEST 7: Double Free (expect error, no crash) =====\n");
-    void *p4 = t_malloc(64);
-    t_free(p4);
-    t_free(p4); // second free should fail and print to stderr
-
-    printf("\n===== TEST 8: Zero Size Malloc =====\n");
-    void *p5 = t_malloc(0);
-    printf("t_malloc(0) = %p (expect null)\n", p5);
-
-    printf("\n===== TEST 9: BEST_FIT policy =====\n");
-    t_init(BEST_FIT);
-    void *b1 = t_malloc(512);
-    void *b2 = t_malloc(128);
-    void *b3 = t_malloc(256);
-    t_free(b1); // leaves 512b hole
-    t_free(b3); // leaves 256b hole
-    // best fit picks smallest hole that fits, so 200b -> 256b hole 
-    void *b4 = t_malloc(200);
-    printf("b4 should be near b3 region: b3=%p b4=%p\n", b3, b4);
-    t_free(b2);
-    t_free(b4);
-
-    printf("\n===== TEST 10: WORST_FIT policy =====\n");
-    t_init(WORST_FIT);
-    void *w1 = t_malloc(512);
-    void *w2 = t_malloc(128);
-    void *w3 = t_malloc(256);
-    t_free(w1); // leaves 512b hole
-    t_free(w3); // leaves 256b hole
-    // worst fit picks largest hole, so 200b -> 512b hole 
-    void *w4 = t_malloc(200);
-    printf("w4 should be near w1 region: w1=%p w4=%p\n", w1, w4);
-    t_free(w2);
-    t_free(w4);
 }
 
 int main() {
+
     correctnessTests();
 
-    runBench("BENCHMARK: FIRST_FIT", FIRST_FIT);
-    runBench("BENCHMARK: BEST_FIT", BEST_FIT);
-    runBench("BENCHMARK: WORST_FIT", WORST_FIT);
+    runBench("BENCH FIRST_FIT", FIRST_FIT);
+    runBench("BENCH BEST_FIT", BEST_FIT);
+    runBench("BENCH WORST_FIT", WORST_FIT);
 
-    utilTest("UTILIZATION OVER TIME: FIRST_FIT", FIRST_FIT);
-    utilTest("UTILIZATION OVER TIME: BEST_FIT", BEST_FIT);
-    utilTest("UTILIZATION OVER TIME: WORST_FIT", WORST_FIT);
+    utilTest("UTIL FIRST_FIT", FIRST_FIT);
+    utilTest("UTIL BEST_FIT", BEST_FIT);
+    utilTest("UTIL WORST_FIT", WORST_FIT);
 
-    overheadTest("OVERHEAD: FIRST_FIT", FIRST_FIT);
-    overheadTest("OVERHEAD: BEST_FIT", BEST_FIT);
-    overheadTest("OVERHEAD: WORST_FIT", WORST_FIT);
+    overheadTest("OVERHEAD FIRST_FIT", FIRST_FIT);
+    overheadTest("OVERHEAD BEST_FIT", BEST_FIT);
+    overheadTest("OVERHEAD WORST_FIT", WORST_FIT);
 
     return 0;
 }

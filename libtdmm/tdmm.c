@@ -258,6 +258,28 @@ void printStats() {
         printf("Avg Utilization: %.4f%%\n", 100.0 * utilSum / utilCount);
 }
 
+size_t getAllocCount() {
+    size_t count = 0;
+    sec *curr = allocH;
+
+    while (curr) {
+        count++;
+        curr = curr->n;
+    }
+
+    return count;
+}
+
+size_t getFrCount() {
+    size_t count = 0;
+    sec *curr = frH;
+    while (curr) {
+        count++;
+        curr = curr->n;
+    }
+    return count;
+}
+
 void *t_malloc(size_t size) {
     if (size == 0)
         return NULL;
